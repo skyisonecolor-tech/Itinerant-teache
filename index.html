@@ -330,7 +330,7 @@ function defaultState(){
     zones:[...DEFAULT_ZONES],
     schools:DEFAULT_SCHOOLS.map(([name,zone,al])=>({id:'s'+(++n), name:fullSchoolName(name), zone, aliases:al||'', avoid:/군서미래국제/.test(name)})),
     seq:n,
-    rule:{maxAvg:16, capAfter:18.5, maxLoop:5, minHours:2, maxOut:3, tol:2},
+    rule:{maxAvg:17, capAfter:18.5, maxLoop:5, minHours:2, maxOut:3, tol:2},
     geo:{coords:{}, min:{}, at:null, method:''},
     subjects:DEFAULT_SUBJECTS.map(([name,al])=>({name, aliases:al||''})),
     needs:[], offers:[], reqFile:null,
@@ -347,7 +347,8 @@ function load(){
   S=defaultState();
 }
 function migrate(){
-  S.rule=Object.assign({maxAvg:16,capAfter:18.5},S.rule||{});
+  S.rule=Object.assign({maxAvg:17,capAfter:18.5},S.rule||{});
+  if(S.rule.maxAvg===16&&!S.rule._v17){S.rule.maxAvg=17;} S.rule._v17=true;
   if(S.rule.capAfter===20) S.rule.capAfter=18.5;
   if(S.rule.maxLoop==null||S.rule.maxLoop===4) S.rule.maxLoop=5; if(S.rule.minHours==null) S.rule.minHours=2; if(S.rule.maxOut==null) S.rule.maxOut=3; if(S.rule.tol==null) S.rule.tol=2;
   // 교과 묶음 (사회·과학·기술가정·진로진학상담)
