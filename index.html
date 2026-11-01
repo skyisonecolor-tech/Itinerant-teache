@@ -330,7 +330,7 @@ function defaultState(){
     zones:[...DEFAULT_ZONES],
     schools:DEFAULT_SCHOOLS.map(([name,zone,al])=>({id:'s'+(++n), name:fullSchoolName(name), zone, aliases:al||'', avoid:/군서미래국제/.test(name)})),
     seq:n,
-    rule:{maxAvg:16, capAfter:18.5, maxLoop:5, minHours:2},
+    rule:{maxAvg:16, capAfter:18.5, maxLoop:5, minHours:2, maxOut:3, tol:2},
     geo:{coords:{}, min:{}, at:null, method:''},
     subjects:DEFAULT_SUBJECTS.map(([name,al])=>({name, aliases:al||''})),
     needs:[], offers:[], reqFile:null,
@@ -349,7 +349,7 @@ function load(){
 function migrate(){
   S.rule=Object.assign({maxAvg:16,capAfter:18.5},S.rule||{});
   if(S.rule.capAfter===20) S.rule.capAfter=18.5;
-  if(S.rule.maxLoop==null||S.rule.maxLoop===4) S.rule.maxLoop=5; if(S.rule.minHours==null) S.rule.minHours=2;
+  if(S.rule.maxLoop==null||S.rule.maxLoop===4) S.rule.maxLoop=5; if(S.rule.minHours==null) S.rule.minHours=2; if(S.rule.maxOut==null) S.rule.maxOut=3; if(S.rule.tol==null) S.rule.tol=2;
   // 교과 묶음 (사회·과학·기술가정·진로진학상담)
   const SG={'사회':'일반사회,지리,통합사회','과학':'물리,화학,생물,생명과학,지구과학,통합과학','도덕':'도덕윤리,윤리'};
   if(S.subjects.some(x=>x.name==='기가')&&!S.subjects.some(x=>x.name==='기술가정')){
@@ -442,6 +442,7 @@ function warnOf(a,list){
   list=list||assigns();
   if(isExt(a.from)) return '';
   const av=[a.from,a.to].filter(isAvoid); if(av.length) return `${av.map(nameOf).join('·')}: 순회 참여 제한 학교 — 꼭 필요한 경우인지 확인`;
+  if(S.rule.maxOut){const dd=new Set(list.filter(x=>x.from===a.from).map(x=>x.to)); if(dd.size>S.rule.maxOut) return `${nameOf(a.from)}: 순회 나가는 학교 ${dd.size}곳 — 최대 ${S.rule.maxOut}곳 초과`;}
   if(S.rule.minHours&&a.hours<S.rule.minHours-1e-9){ const cell=list.filter(x=>x.from===a.from&&x.to===a.to).reduce((t,x)=>t+x.hours,0); if(cell<S.rule.minHours-1e-9) return `${fmt(a.hours)}시간 배정 — 최소 ${S.rule.minHours}시간 미만`; }
   if(a.subject===FREE) return '';  // 자율은 어느 교과에서 오든 무관
   if(S.hours){
@@ -481,7 +482,7 @@ function compute(){
   const add=(o,a,b,v)=>{(o[a]||(o[a]={}));o[a][b]=(o[a][b]||0)+v};
   activeNeeds().forEach(n=>{add(needTot,n.school,n.subject,n.hours);add(needRem,n.school,n.subject,n.hours)});
   activeOffers().forEach(o=>{add(offerTot,o.school,o.subject,o.hours);add(offerRem,o.school,o.subject,o.hours)});
-  const participants=new Set(); const offList=[]; const overList=[];
+  const participants=new Set(); const offList=[]; const overList=[]; const devList=[];
   A.forEach(a=>{
     give[a.from]=(give[a.from]||0)+a.hours; recv[a.to]=(recv[a.to]||0)+a.hours;
     participants.add(a.from); participants.add(a.to);
@@ -493,14 +494,17 @@ function compute(){
   });
   const unmet=[];
   Object.entries(needRem).forEach(([sc,m])=>Object.entries(m).forEach(([sub,v])=>{
-    if(v>0.001 && needTot[sc]&&needTot[sc][sub]) unmet.push({school:sc,subject:sub,rem:v});
-    if(v<-0.001){ if(needTot[sc]&&needTot[sc][sub]) overList.push({school:sc,subject:sub,over:-v}); }
+    if(!(needTot[sc]&&needTot[sc][sub])) return;
+    const tl=tolFor(sc,sub);
+    if(v>tl+0.001) unmet.push({school:sc,subject:sub,rem:v});
+    else if(Math.abs(v)>0.001 && (v>0 || -v<=tl+0.001)) devList.push({school:sc,subject:sub,diff:-v});
+    if(v<-0.001 && -v>tl+0.001) overList.push({school:sc,subject:sub,over:-v});
   }));
   unmet.forEach(u=>u.nt=noTeacher(u.school,u.subject));
   unmet.sort((a,b)=>(b.nt-a.nt)||b.rem-a.rem||subjOrder(a.subject)-subjOrder(b.subject));
   const bal={}; const unbalanced=[];
   [...participants].filter(x=>!isExt(x)).forEach(id=>{bal[id]=(give[id]||0)-(recv[id]||0); if(Math.abs(bal[id])>0.001) unbalanced.push(id)});
-  return {needTot,offerTot,needRem,offerRem,give,recv,participants,unmet,bal,unbalanced,warn:new Map(offList),overList};
+  return {needTot,offerTot,needRem,offerRem,give,recv,participants,unmet,bal,unbalanced,warn:new Map(offList),overList,devList};
 }
 
 /* =========================================================
@@ -523,12 +527,14 @@ function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a
 function buildPlan(keepManual,rng){
   if(!S.hours){const prev=assigns(); autoAssignOffers(keepManual); const r=assigns(); setAssigns(prev); return r;}
   const R0=()=>rng?rng():0;
+  const TOL=S.rule.tol??2, MIN=S.rule.minHours||0, MAXOUT=S.rule.maxOut||99;
   const kept=keepManual?assigns().filter(a=>a.kind==='manual'):[];
   const out=kept.map(a=>({...a}));
   const needs=activeNeeds().map(n=>({...n,rem:n.hours}));
   const given={};
   const addGiven=(g,s,h)=>{(given[g]||(given[g]={}));given[g][s]=(given[g][s]||0)+h};
   const takeNeed=(school,subj,h)=>{let left=h; for(const r of needs){if(left<=1e-9) break; if(r.school===school&&r.subject===subj&&r.rem>0){const t=Math.min(r.rem,left); r.rem-=t; left-=t}} return h-left};
+  const closeNeed=(school,subj)=>needs.forEach(r=>{if(r.school===school&&r.subject===subj) r.rem=0});
   kept.forEach(a=>{ if(a.subject!==FREE){takeNeed(a.to,a.subject,a.hours); addGiven(a.from,a.subject,a.hours);} });
   const addA=(from,to,subject,hours)=>{
     if(hours<=1e-9) return; addGiven(from,subject,hours);
@@ -536,6 +542,23 @@ function buildPlan(keepManual,rng){
     if(ex) ex.hours+=hours; else out.push({id:uid(),from,to,subject,hours,kind:'auto'});
   };
   const cap=(g,s)=>{const v=hv(g,s); if(!v||!v.t||!eligible(g,s)) return 0; return Math.max(0,Math.floor(S.rule.capAfter*v.t-v.h-((given[g]||{})[s]||0)+1e-9))};
+  const tolOf=(sc,sub)=>tolFor(sc,sub);
+  const dests=g=>new Set(out.filter(a=>a.from===g).map(a=>a.to));
+  const canGo=(g,R)=>{const d=dests(g); return d.has(R)||d.size<MAXOUT};
+  /* 요청 r시간, 줄 수 있는 c시간, 허용 오차 t → 줄 양 f 와 이걸로 요청을 마무리할지(close) */
+  const amount=(r,c,t)=>{
+    if(c<MIN-1e-9) return null;
+    if(c>=r-1e-9) return {f:r,close:true};                 // 한 학교가 전부
+    if(c>=r-t-1e-9) return {f:c,close:true};               // 1~2시간 덜 받는 것으로 마무리 (쪼개지 않음)
+    const f=Math.floor(Math.min(c,r-MIN)+1e-9);            // 어쩔 수 없이 나눔 (조각·나머지 모두 최소 시수 이상)
+    return f>=MIN-1e-9?{f,close:false}:null;
+  };
+  /* 되돌려 줄 양: back 에 최대한 맞추되 상대 요청의 허용 범위 안에서 */
+  const backAmount=(back,nr,cp,t)=>{
+    const lo=Math.max(MIN,nr-t), hi=Math.min(cp,nr+t);
+    if(lo<=hi+1e-9) return {x:Math.min(hi,Math.max(lo,back)),close:true};
+    const a=amount(nr,Math.min(cp,back),t); return a?{x:a.f,close:a.close}:null;
+  };
   const OF=activeOffers();
   const offered=(g,s)=>OF.some(o=>o.school===g&&o.subject===s);
   const needRem=(sc,s)=>needs.reduce((t,n)=>t+(n.school===sc&&n.subject===s?n.rem:0),0);
@@ -545,32 +568,54 @@ function buildPlan(keepManual,rng){
   const order=needs.filter(n=>n.rem>1e-9).map(n=>({n,k:[noTeacher(n.school,n.subject)?0:1, -n.rem+R0()*6]})).sort((a,b)=>cmpArr(a.k,b.k)).map(x=>x.n);
   for(const n of order){
     for(let guard=0;n.rem>1e-9&&guard<20;guard++){
-      const R=n.school,sub=n.subject;
-      const cands=internal.filter(g=>g!==R&&pieceSize(n.rem,cap(g,sub))>0).map(g=>{
-        const c=pieceSize(n.rem,cap(g,sub)); const recip=needSubs(g).some(t=>pieceSize(needRem(g,t),cap(R,t))>0); const tt=travel(g,R);
-        const cost=(isAvoid(g)?100000:0)+(zoneOf(g)===zoneOf(R)?0:1000)+(recip?0:30)+(offered(g,sub)?0:15)+(tt==null?20:tt)+(participates(g)?0:10)+(c>=n.rem?0:8)+avgOf(g,sub)*0.5+R0()*25;
-        return {g,c,recip,cost};
-      }).sort((a,b)=>a.cost-b.cost);
+      const R=n.school,sub=n.subject,t=tolOf(R,sub);
+      const pick=strict=>internal.filter(g=>g!==R&&(!strict||canGo(g,R))).map(g=>{
+        const a=amount(n.rem,cap(g,sub),t); if(!a) return null;
+        const recip=canGo(R,g)&&needSubs(g).some(T=>backAmount(a.f,needRem(g,T),cap(R,T),tolOf(g,T)));
+        const tt=travel(g,R);
+        const cost=(isAvoid(g)?100000:0)+(strict?0:50000)+(zoneOf(g)===zoneOf(R)?0:1000)+(a.close?0:40)+(recip?0:30)+(offered(g,sub)?0:15)+(tt==null?20:tt)+(participates(g)?0:10)+(n.rem-a.f)*6+avgOf(g,sub)*0.5+R0()*25;
+        return {g,a,recip,cost};
+      }).filter(Boolean).sort((x,y)=>x.cost-y.cost);
+      let cands=pick(true); if(!cands.length) cands=pick(false);   // 3곳 제한으로 못 채우면 마지막 수단
       if(!cands.length) break;
-      const b=cands[0]; const f=b.c;
-      addA(b.g,R,sub,f); n.rem-=f;
+      const b=cands[0]; const f=b.a.f;
+      addA(b.g,R,sub,f); n.rem-=f; if(b.a.close) closeNeed(R,sub);
       if(b.recip){
         let back=f;
-        const ts=needSubs(b.g).filter(t=>pieceSize(needRem(b.g,t),cap(R,t))>0).sort((x,y)=>(noTeacher(b.g,y)-noTeacher(b.g,x))||needRem(b.g,y)-needRem(b.g,x)+(R0()-0.5)*4);
-        for(const t of ts){ if(back<=1e-9) break;
-          const m=S.rule.minHours||0, nr=needRem(b.g,t), cp=cap(R,t);
-          let r=pieceSize(nr,Math.min(back,cp)); if(r<=1e-9) continue;
-          const left=back-r;
-          if(left>1e-9&&left<m-1e-9){ // 되돌려 줄 양이 1시간만 남지 않게 조정
-            if(back<=cp+1e-9&&pieceSize(nr,back)===back) r=back;
-            else if(r-(m-left)>=m-1e-9&&pieceSize(nr,r-(m-left))>0) r=r-(m-left);
-          }
-          addA(R,b.g,t,r); takeNeed(b.g,t,r); back-=r; }
+        const ts=needSubs(b.g).sort((x,y)=>(noTeacher(b.g,y)-noTeacher(b.g,x))||Math.abs(needRem(b.g,x)-back)-Math.abs(needRem(b.g,y)-back)+(R0()-0.5)*2);
+        for(const T of ts){
+          if(back<MIN-1e-9||!canGo(R,b.g)) break;
+          const ba=backAmount(back,needRem(b.g,T),cap(R,T),tolOf(b.g,T)); if(!ba||ba.x<=1e-9) continue;
+          addA(R,b.g,T,ba.x); takeNeed(b.g,T,ba.x); if(ba.close) closeNeed(b.g,T); back-=ba.x;
+        }
       }
     }
   }
   balanceFree(out,rng);
   return out;
+}
+/* 요청별 허용 오차: 설정값(±2) 이내, 요청 시수의 1/3 이내, 교사 0명 교과는 0 */
+function tolFor(sc,sub){ if(noTeacher(sc,sub)) return 0; const n=activeNeeds().reduce((t,x)=>t+(x.school===sc&&x.subject===sub?x.hours:0),0); return Math.min(S.rule.tol??0, Math.floor(n/3+1e-9)); }
+/* 허용 범위(±n시간) 안에서 기존 교과 배정을 늘이거나 줄여 줌·받음 차이를 맞춤 → 「자율」 최소화 */
+function tolRepair(list){
+  const TOL=S.rule.tol??2, MIN=S.rule.minHours||0; if(!TOL) return;
+  const need={}; activeNeeds().forEach(n=>{const k=n.school+'|'+n.subject; need[k]=(need[k]||0)+n.hours});
+  const recvOf=(sc,sub)=>list.reduce((t,a)=>t+(a.to===sc&&a.subject===sub?a.hours:0),0);
+  const capOf=(g,sub)=>{const v=hv(g,sub); if(!v||!v.t||!eligible(g,sub)) return 0; return Math.max(0,Math.floor(S.rule.capAfter*v.t-v.h-list.reduce((t,a)=>t+(a.from===g&&a.subject===sub?a.hours:0),0)+1e-9))};
+  for(let it=0;it<60;it++){
+    const bal={}; list.forEach(a=>{bal[a.from]=(bal[a.from]||0)+a.hours; bal[a.to]=(bal[a.to]||0)-a.hours});
+    let done=false;
+    for(const e of list){
+      if(e.subject===FREE||isExt(e.from)||isExt(e.to)) continue;
+      const k=e.to+'|'+e.subject; if(!need[k]||noTeacher(e.to,e.subject)) continue; const TL=tolFor(e.to,e.subject); if(!TL) continue;
+      const dev=recvOf(e.to,e.subject)-need[k];
+      // 줄이기: 주는 학교가 더 줬고(+) 받는 학교가 더 받았을(-) 때
+      if(bal[e.from]>1e-9&&bal[e.to]<-1e-9){ const d=Math.min(bal[e.from],-bal[e.to],e.hours-MIN,dev+TL); if(d>=1-1e-9){e.hours-=Math.floor(d); done=true; break;} }
+      // 늘리기: 주는 학교가 덜 줬고(-) 받는 학교가 덜 받았을(+) 때
+      if(bal[e.from]<-1e-9&&bal[e.to]>1e-9){ const d=Math.min(-bal[e.from],bal[e.to],TL-dev,capOf(e.from,e.subject)); if(d>=1-1e-9){e.hours+=Math.floor(d); done=true; break;} }
+    }
+    if(!done) break;
+  }
 }
 /* 최소 배정 시수를 지키는 분량: need 중 cap 만큼 줄 때, 조각과 남는 양이 모두 최소 시수 이상이 되게 */
 function pieceSize(need,cap){
@@ -585,7 +630,7 @@ function planScore(list){
   const need={},recv={};
   activeNeeds().forEach(n=>{const k=n.school+'|'+n.subject; need[k]=(need[k]||0)+n.hours});
   list.forEach(a=>{if(a.subject!==FREE){const k=a.to+'|'+a.subject; recv[k]=(recv[k]||0)+a.hours}});
-  let unmet=0,p0=0; Object.entries(need).forEach(([k,v])=>{const r=Math.max(0,v-(recv[k]||0)); unmet+=r; const [sc,sub]=k.split('|'); if(noTeacher(sc,sub)) p0+=r});
+  let unmet=0,p0=0,dev=0; Object.entries(need).forEach(([k,v])=>{const [sc,sub]=k.split('|'); const nt=noTeacher(sc,sub); const tl=tolFor(sc,sub); const d=v-(recv[k]||0); const r=d>tl+1e-9?d:0; unmet+=r; if(nt) p0+=Math.max(0,d); if(!r) dev+=Math.abs(d);});
   const warn=list.filter(a=>warnOf(a,list)).length;
   const bal={}; list.forEach(a=>{bal[a.from]=(bal[a.from]||0)+a.hours; bal[a.to]=(bal[a.to]||0)-a.hours});
   const imb=Object.values(bal).reduce((t,v)=>t+Math.abs(v),0)/2;
@@ -593,8 +638,8 @@ function planScore(list){
   list.forEach(a=>{parts.add(a.from);parts.add(a.to); if(zoneOf(a.from)!==zoneOf(a.to)) cross+=a.hours; const t=travel(a.from,a.to); trav+=a.hours*(t==null?15:t); if(a.subject===FREE) free+=a.hours});
   const LP=loopsOf(list); const long=LP.loops.filter(l=>l.nodes.length>(S.rule.maxLoop||5)).length; const maxLoop=Math.max(0,...LP.loops.map(l=>l.nodes.length));
   const avoidH=list.filter(a=>isAvoid(a.from)||isAvoid(a.to)).reduce((t,a)=>t+a.hours,0);
-  const total=p0*1000+unmet*300+warn*200+imb*50+long*400+avoidH*30+cross*3+trav*0.05+free*1.5+parts.size*3+list.length*1.5;
-  return {total:Math.round(total*10)/10,unmet,p0,warn,imb,cross,trav:Math.round(trav),free,parts:parts.size,links:list.length,long,maxLoop};
+  const total=p0*1000+unmet*300+warn*200+imb*50+long*400+dev*12+avoidH*30+cross*3+trav*0.05+free*1.5+parts.size*3+list.length*1.5;
+  return {total:Math.round(total*10)/10,unmet,p0,dev,warn,imb,cross,trav:Math.round(trav),free,parts:parts.size,links:list.length,long,maxLoop};
 }
 const manSig=()=>planSig(assigns().filter(a=>a.kind==='manual'));
 const planSig=l=>l.map(a=>`${a.from}>${a.to}:${a.subject}:${a.hours}`).sort().join(',');
@@ -725,6 +770,7 @@ function pathLens(list,target){
   delete dist[target]; return dist;
 }
 function balanceFree(list,rng){
+  if(S.hours) tolRepair(list);
   const bal={};
   list.forEach(a=>{ if(!isExt(a.from)) bal[a.from]=(bal[a.from]||0)+a.hours; if(!isExt(a.to)) bal[a.to]=(bal[a.to]||0)-a.hours; });
   const def=Object.keys(bal).filter(k=>bal[k]<-1e-9).sort((a,b)=>bal[a]-bal[b]); // 받은 시수가 더 많은 학교 → 「자율」로 더 줘야 함
@@ -734,7 +780,7 @@ function balanceFree(list,rng){
       const sur=Object.keys(bal).filter(k=>bal[k]>1e-9&&k!==d);
       if(!sur.length) break;
       const dist=pathLens(list,d); // x → … → d 경로 길이(간선 수). d→x 「자율」을 더하면 (길이+1)개교 고리
-      const key=x=>{const tt=(travel(d,x)??20)+(rng?rng()*6:0); const ds=dist[x]??99; const f0=Math.min(bal[x],-bal[d]); const ex0=list.some(a=>a.from===d&&a.to===x); return [ds<=(S.rule.maxLoop||5)-1?0:1, isAvoid(x)?1:0, (f0>=(S.rule.minHours||0)-1e-9||ex0)?0:1, ds, Math.abs(bal[x]+bal[d])<1e-9?0:1, zoneOf(x)===zoneOf(d)?0:1, bal[x]>=-bal[d]?0:1, tt, -bal[x]]};
+      const key=x=>{const tt=(travel(d,x)??20)+(rng?rng()*6:0); const ds=dist[x]??99; const f0=Math.min(bal[x],-bal[d]); const ex0=list.some(a=>a.from===d&&a.to===x); const outOk=(()=>{const dd=new Set(list.filter(a=>a.from===d).map(a=>a.to)); return dd.has(x)||dd.size<(S.rule.maxOut||99)})(); return [ds<=(S.rule.maxLoop||5)-1?0:1, outOk?0:1, isAvoid(x)?1:0, (f0>=(S.rule.minHours||0)-1e-9||ex0)?0:1, ds, Math.abs(bal[x]+bal[d])<1e-9?0:1, zoneOf(x)===zoneOf(d)?0:1, bal[x]>=-bal[d]?0:1, tt, -bal[x]]};
       sur.sort((x,y)=>cmpArr(key(x),key(y)));
       const s=sur[0]; const f=Math.min(bal[s],-bal[d]);
       const ex=list.find(a=>a.from===d&&a.to===s&&a.subject===FREE);
@@ -907,6 +953,13 @@ function renderAssign(){
     h+='</div>';
   }
   h+='</div>';
+  if(C.devList.length){
+    h+=`<div class="card"><h3>요청과 다르게 배정 <span class="pill">${C.devList.length}건</span></h3><div class="small muted" style="margin-bottom:6px">순회를 단순하게 하려고 허용 범위(±${S.rule.tol}시간, 요청의 1/3 이내) 안에서 조정한 항목입니다. 교사 0명 교과는 조정하지 않습니다.</div><div class="list">`;
+    C.devList.sort((a,b)=>allOrder()(a.school)-allOrder()(b.school)).forEach(d=>{h+=`<div class="li"><div class="grow"><b>${esc(nameOf(d.school))}</b> · ${esc(d.subject)} <span class="small muted">요청 ${fmt(C.needTot[d.school][d.subject])} → 받음 ${fmt(C.needTot[d.school][d.subject]+d.diff)}</span></div><span class="pill ${d.diff>0?'offer':'warn'}">${d.diff>0?'+':''}${fmt(d.diff)}</span></div>`});
+    h+='</div></div>';
+  }
+  { const outs=S.schools.map(sc=>({id:sc.id,n:new Set(A.filter(a=>a.from===sc.id).map(a=>a.to)).size})).filter(x=>x.n>0).sort((a,b)=>b.n-a.n);
+    if(outs.length) h+=`<div class="card"><h3>학교별 순회 나가는 곳</h3><div class="small muted" style="margin-bottom:6px">한 학교가 순회를 나가는 학교는 최대 ${S.rule.maxOut}곳</div><div class="chips">${outs.map(x=>`<span class="pill ${x.n>S.rule.maxOut?'need':x.n===S.rule.maxOut?'warn':''}">${esc(nameOf(x.id).replace(/중학교$/,'중'))} ${x.n}곳</span>`).join('')}</div></div>`; }
   if(C.warn.size){
     h+=`<div class="card" style="border-color:var(--warn)"><h3>원칙 예외 <span class="pill warn">${C.warn.size}건</span></h3><div class="small muted" style="margin-bottom:6px">예외로 운영하는 사유를 메모로 남겨 두세요. 화면에서만 보이고 출력·엑셀에는 나오지 않습니다.</div><div class="list">`;
     A.filter(a=>C.warn.has(a.id)).forEach(a=>{
@@ -1402,7 +1455,9 @@ function renderSettings(){
       <label>지원 가능 기준: 교과 평균시수(시수÷교사수) <input type="number" step="0.5" min="0" value="${S.rule.maxAvg}" data-rule="maxAvg"> 이하</label>
       <label>지원 후 평균시수 상한 <input type="number" step="0.5" min="0" value="${S.rule.capAfter}" data-rule="capAfter"> 이하</label>
       <label>순환 고리 최대 <input type="number" step="1" min="2" value="${S.rule.maxLoop}" data-rule="maxLoop">개교</label>
-      <label>1건 최소 배정 <input type="number" step="1" min="1" value="${S.rule.minHours}" data-rule="minHours">시간</label></div>
+      <label>1건 최소 배정 <input type="number" step="1" min="1" value="${S.rule.minHours}" data-rule="minHours">시간</label>
+      <label>한 학교가 나가는 학교 최대 <input type="number" step="1" min="1" value="${S.rule.maxOut}" data-rule="maxOut">곳</label>
+      <label>요청 대비 허용 오차 ± <input type="number" step="1" min="0" value="${S.rule.tol}" data-rule="tol">시간 (요청 시수의 1/3 이내, 교사 0명 교과 제외)</label></div>
     <div class="small muted" style="margin-top:6px">· 시수는 있으나 교사가 없는 교과 요청을 가장 먼저 배정합니다.<br>· 기준을 넘는 학교에 직접 배정하면 화면에서 ⚠ 예외로 표시되고 메모를 남길 수 있습니다(출력·엑셀에는 표시 안 됨).<br>· 지원 후 평균(=(시수+지원 시수)÷교사수)이 상한을 넘는 배정도 예외로 표시됩니다.</div></div>`;
   h+=`<div class="card"><h3>권역 (학교 지역)</h3>
     <div class="chips" style="margin-bottom:10px">${S.zones.map((z,i)=>`<span class="chip"><input type="text" value="${esc(z)}" data-zone="${i}"><button data-act="delZone" data-i="${i}" title="삭제">✕</button></span>`).join('')}<button class="btn sm" data-act="addZone">＋ 권역</button></div>
@@ -1917,7 +1972,7 @@ function refreshPop(){if(!popCell) return; const td=document.querySelector(`[dat
 document.addEventListener('change',e=>{
   const t=e.target;
   if(t.dataset.memo){const a=assigns().find(x=>x.id===t.dataset.memo); if(a){a.memo=t.value.trim(); save(); if(!$('#pop').contains(t)) renderAll(); else {renderAll(); refreshPop();}} return}
-  if(t.dataset.rule){const v=num(t.value); if(v>0){S.rule[t.dataset.rule]=v; save(); renderSettings();} return}
+  if(t.dataset.rule){const v=num(t.value); if(v>0||(t.dataset.rule==='tol'&&v>=0)){S.rule[t.dataset.rule]=v; save(); renderSettings();} return}
   if(t.dataset.geo){const c=S.geo.coords[t.dataset.geo]||{}; const v=t.value.trim(); if(v===''){delete c[t.dataset.k]} else c[t.dataset.k]=num(v); c.src='직접 입력';
     if(c.lat!=null&&c.lng!=null) S.geo.coords[t.dataset.geo]=c; else if(c.lat==null&&c.lng==null) delete S.geo.coords[t.dataset.geo]; else S.geo.coords[t.dataset.geo]=c;
     save(); return}
